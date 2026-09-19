@@ -1,19 +1,26 @@
-
-
 import os
+import sys
 import json
 import math
 import argparse
+from typing import Optional, Tuple, Dict, Any, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, set_seed
 from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
 from transformers.cache_utils import Cache
-from qwen_vl_utils import process_vision_info
+try:
+    from qwen_vl_utils import process_vision_info
+except ImportError:
+    process_vision_info = None
 from tqdm import tqdm
-import pdb
+
+# Ensure module import paths
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from causallens_utils.coco_path_finder import find_coco_val2014_dir
+from pope_evaluator import evaluate_pope, extract_prediction
+
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -31,7 +38,7 @@ class Qwen2VLAttnAdapter(nn.Module):
     """
     Custom Attention Adapter for Qwen2-VL
     
-    Similar to AttnAdapter for LLaMA, this implements:
+    Implements:
     - Head-level hybrid intervention
     - Enhancement of attention to image tokens
     - Suppression of attention to system/text tokens
@@ -48,7 +55,7 @@ class Qwen2VLAttnAdapter(nn.Module):
         config,
         layer_idx: int = 0,
         lambda_causal: float = 0.15,
-        gamma_mix: float = 0.2,
+        gamma_mix: float = 0.15,
         sys_len: int = 31,
         img_len: int = 256,
     ):
@@ -171,14 +178,12 @@ class Qwen2VLAttnAdapter(nn.Module):
         A_sys = attn_weights[..., :vis_start]
         A_vis = attn_weights[..., vis_start:vis_end]
         A_rest = attn_weights[..., vis_end:]
-        # A_lang = A_sys + A_rest (non-image attention)
         
         V_sys = value_states[..., :vis_start, :]
         V_vis = value_states[..., vis_start:vis_end, :]
         V_rest = value_states[..., vis_end:, :]
         
         # Compute per-path head outputs
-        # h_lang = h_sys + h_rest (combined non-image tokens)
         h_sys = torch.zeros(bsz, self.num_heads, q_len, self.head_dim, device=device, dtype=query_states.dtype)
         if vis_start > 0:
             h_sys = torch.matmul(A_sys, V_sys)
@@ -199,7 +204,6 @@ class Qwen2VLAttnAdapter(nn.Module):
         h_orig = h_lang + h_vis
         
         # ========== Step 7: Compute Visual Causal Sensitivity Score ==========
-        # Based on difference between image tokens and non-image tokens
         if vis_end > vis_start:
             var = A_vis.var(dim=-1, keepdim=True)
             mean = A_vis.mean(dim=-1, keepdim=True)
@@ -217,8 +221,6 @@ class Qwen2VLAttnAdapter(nn.Module):
         gamma = gamma_dynamic
         
         # ========== Step 9: Hybrid Intervention ==========
-        # Compute difference between image tokens and non-image tokens
-        # delta = h_vis - h_lang (image - non-image)
         h_head = (1.0 - gamma) * h_orig + gamma * (
             h_lang + self.lambda_causal * s_score * (h_vis - h_lang)
         )
@@ -244,11 +246,9 @@ class Qwen2VLAttnAdapter(nn.Module):
 
 def find_vision_token_range(input_ids: torch.Tensor) -> Tuple[int, int]:
     """
-    Find vision token range from input_ids
-    
-    Qwen2-VL special tokens:
-        vision_start_token_id: 151652 (<|vision_start|>)
-        vision_end_token_id: 151653 (<|vision_end|>)
+    Find vision token range from input_ids for Qwen2-VL.
+    vision_start_token_id: 151652 (<|vision_start|>)
+    vision_end_token_id: 151653 (<|vision_end|>)
     """
     vision_start_id = 151652
     vision_end_id = 151653
@@ -276,16 +276,15 @@ def find_vision_token_range(input_ids: torch.Tensor) -> Tuple[int, int]:
 def replace_attention_with_adapter(
     model,
     target_layer_range: Tuple[int, int] = (10, 20),
-    lambda_causal: float = 0.25,
-    gamma_mix: float = 0.25,
+    lambda_causal: float = 0.15,
+    gamma_mix: float = 0.15,
     sys_len: int = 31,
     img_len: int = 256,
-):
+) -> List[Qwen2VLAttnAdapter]:
     """
-    Replace self_attn in specified layers with Qwen2VLAttnAdapter
+    Replace self_attn in specified layers [layer_start, layer_end] (inclusive) with Qwen2VLAttnAdapter.
     """
     adapters = []
-    
     qwen2vl_model = model.model
     
     if hasattr(qwen2vl_model, 'language_model'):
@@ -297,8 +296,8 @@ def replace_attention_with_adapter(
         raise AttributeError(f"Cannot find layers in model. Available attributes: {[n for n, _ in qwen2vl_model.named_children()]}")
     
     for i, layer in enumerate(layers):
-        if target_layer_range[0] < i < target_layer_range[1]:
-            print(f"Replacing layer {i} self_attn with Qwen2VLAttnAdapter")
+        if target_layer_range[0] <= i <= target_layer_range[1]:
+            print(f"[CausalLens Qwen2-VL] Replacing layer {i} self_attn with Qwen2VLAttnAdapter")
             
             attn_adapter = Qwen2VLAttnAdapter(
                 config=model.config,
@@ -319,218 +318,248 @@ def replace_attention_with_adapter(
             if hasattr(layer.self_attn, 'rotary_emb'):
                 attn_adapter.rotary_emb = layer.self_attn.rotary_emb
             
-            # Convert to same dtype and device as model
-            attn_adapter = attn_adapter.to(
-                dtype=next(layer.self_attn.parameters()).dtype,
-                device=next(layer.self_attn.parameters()).device
-            )
+            # Preserve accelerate multi-GPU hook if present
+            if hasattr(layer.self_attn, '_hf_hook'):
+                attn_adapter._hf_hook = layer.self_attn._hf_hook
+            
+            # Convert to same dtype and device as original layer
+            param = next(layer.self_attn.parameters())
+            attn_adapter = attn_adapter.to(dtype=param.dtype, device=param.device)
             
             # Replace self_attn
             layer.self_attn = attn_adapter
             adapters.append(attn_adapter)
     
-    print(f"\nReplaced {len(adapters)} layers with Qwen2VLAttnAdapter")
+    print(f"[CausalLens Qwen2-VL] Successfully injected {len(adapters)} Qwen2VLAttnAdapter modules.")
     return adapters
 
 
-def update_adapters_token_range(adapters, sys_len: int, img_len: int):
-    """Update token range for all adapters"""
+def update_adapters_token_range(adapters: List[Qwen2VLAttnAdapter], sys_len: int, img_len: int):
+    """Update token range for all adapters per sample."""
     for adapter in adapters:
         adapter.update_token_range(sys_len, img_len)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Qwen2-VL Attention Adapter for POPE Evaluation")
-    parser.add_argument("--model_path", type=str, 
-                        default="/checkpoint/Qwen2-VL-7B-Instruct",
-                        help="Path to Qwen2-VL model")
-    parser.add_argument("--pope_path", type=str,
-                        default="/CausalLens/experiments/data/POPE/coco/coco_pope_popular.json",
-                        help="Path to POPE dataset json file")
-    parser.add_argument("--image_dir", type=str,
-                        default="/CausalLens/experiments/data/COCO/val2014",
-                        help="Path to COCO val2014 images directory")
-    parser.add_argument("--output_dir", type=str,
-                        default="/CausalLens/qwenvloutput",
-                        help="Output directory for results")
-    parser.add_argument("--lambda_causal", type=float, default=0.15,
-                        help="Intervention strength (higher = stronger modification)")
-    parser.add_argument("--gamma_mix", type=float, default=0.15,
-                        help="Mixing ratio between residual and replacement")
-    parser.add_argument("--layer_start", type=int, default=10,
-                        help="Start layer for replacement (exclusive)")
-    parser.add_argument("--layer_end", type=int, default=20,
-                        help="End layer for replacement (exclusive)")
-    parser.add_argument("--max_new_tokens", type=int, default=64,
-                        help="Maximum new tokens to generate")
+def run_qwen2vl_pope(
+    model_path: str = "Qwen/Qwen2-VL-7B-Instruct",
+    pope_dir: str = "experiments/data/POPE/coco",
+    image_dir: Optional[str] = None,
+    output_dir: str = "results",
+    split: str = "all",
+    lambda_causal: float = 0.15,
+    gamma_mix: float = 0.15,
+    layer_start: int = 10,
+    layer_end: int = 20,
+    max_new_tokens: int = 6,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Run POPE evaluation with CausalLens intervention on Qwen2-VL-7B.
+    """
+    set_seed(seed)
     
-    args = parser.parse_args()
+    if process_vision_info is None:
+        raise ImportError(
+            "qwen_vl_utils is required for running Qwen2-VL. "
+            "Please install it with: pip install qwen_vl_utils"
+        )
     
-    # Create output directory if not exists
-    os.makedirs(args.output_dir, exist_ok=True)
+    # 1. Resolve image and annotation paths
+    image_dir = find_coco_val2014_dir(image_dir)
+    print(f"[Qwen2-VL Runner] COCO val2014 directory: {image_dir}")
     
-    print("=" * 70)
-    print("Qwen2-VL Attention Adapter - POPE Evaluation")
-    print("=" * 70)
-    print(f"lambda_causal: {args.lambda_causal} (intervention strength)")
-    print(f"gamma_mix: {args.gamma_mix} (mixing ratio)")
-    print(f"Layer range: ({args.layer_start}, {args.layer_end})")
-    print(f"POPE dataset: {args.pope_path}")
-    print(f"Image directory: {args.image_dir}")
-    print(f"Output directory: {args.output_dir}")
-    print("=" * 70)
+    splits = ["random", "popular", "adversarial"] if split == "all" else [split]
+    for s in splits:
+        pope_file = os.path.join(pope_dir, f"coco_pope_{s}.json")
+        if not os.path.exists(pope_file):
+            raise FileNotFoundError(f"POPE annotation file not found: {pope_file}")
+            
+    # 2. Precision & Model Loading
+    torch_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    print(f"[Qwen2-VL Runner] Loading {model_path} with dtype={torch_dtype}, eager attention, device_map='auto'...")
     
-    # Load model
-    print("\nLoading model...")
     model = Qwen2VLForConditionalGeneration.from_pretrained(
-        args.model_path,
-        torch_dtype="auto",
-        device_map="auto"
+        model_path,
+        torch_dtype=torch_dtype,
+        device_map="auto" if torch.cuda.is_available() else None,
+        attn_implementation="eager",
+        low_cpu_mem_usage=True,
     )
-    processor = AutoProcessor.from_pretrained(args.model_path)
+    model.eval()
     
-    # Replace attention layers with initial token range (will be updated per sample)
+    # Restrict max_pixels to 313600 per HANDOVER requirements (speeds up generation)
+    processor = AutoProcessor.from_pretrained(
+        model_path,
+        min_pixels=256 * 28 * 28,
+        max_pixels=313600,
+    )
+    
+    # 3. Inject CausalLens Adapters
     adapters = replace_attention_with_adapter(
         model,
-        target_layer_range=(args.layer_start, args.layer_end),
-        lambda_causal=args.lambda_causal,
-        gamma_mix=args.gamma_mix,
+        target_layer_range=(layer_start, layer_end),
+        lambda_causal=lambda_causal,
+        gamma_mix=gamma_mix,
         sys_len=31,
         img_len=256,
     )
     
-    # Read POPE dataset
-    print("\nReading POPE dataset...")
-    pope_data = []
-    with open(args.pope_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                pope_data.append(json.loads(line))
+    all_results = {}
     
-    print(f"Total samples: {len(pope_data)}")
-    
-    # Output file path
-    output_filename = f"pope_ours_lambda_{args.lambda_causal}_gamma_{args.gamma_mix}.jsonl"
-    output_path = os.path.join(args.output_dir, output_filename)
-    
-    # Process each sample
-    print(f"\nProcessing samples and saving to {output_path}...")
-    
-    with open(output_path, 'w') as f_out:
-        for item in tqdm(pope_data, desc="Evaluating"):
-            question_id = item['question_id']
-            image_name = item['image']
-            question = item['text']
-            label = item['label']
+    # 4. Process splits
+    for s in splits:
+        pope_file = os.path.join(pope_dir, f"coco_pope_{s}.json")
+        split_out_dir = os.path.join(output_dir, s)
+        os.makedirs(split_out_dir, exist_ok=True)
+        raw_output_path = os.path.join(split_out_dir, "raw_outputs.jsonl")
+        metrics_output_path = os.path.join(split_out_dir, "metrics.json")
+        config_output_path = os.path.join(split_out_dir, "run_config.json")
+        
+        run_config = {
+            "model": "qwen2vl",
+            "model_path": model_path,
+            "split": s,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "temperature": 0.0,
+            "prompt_suffix": "Please answer with yes or no.",
+            "lambda_causal": lambda_causal,
+            "gamma_mix": gamma_mix,
+            "layer_start": layer_start,
+            "layer_end": layer_end,
+            "seed": seed,
+            "torch_dtype": str(torch_dtype),
+            "attn_implementation": "eager",
+        }
+        with open(config_output_path, "w", encoding="utf-8") as f:
+            json.dump(run_config, f, indent=2)
             
-            # Construct image path
-            image_path = os.path.join(args.image_dir, image_name)
+        with open(pope_file, "r", encoding="utf-8") as f:
+            samples = [json.loads(line) for line in f if line.strip()]
             
-            # Check if image exists
-            if not os.path.exists(image_path):
-                print(f"\nWarning: Image not found: {image_path}")
-                continue
-            
-            # # Prepare input
-            # messages = [
-            #     {
-            #         "role": "user",
-            #         "content": [
-            #             {"type": "image", "image": image_path},
-            #             {"type": "text", "text": question},
-            #         ],
-            #     }
-            # ]
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human\'s questions."},
-                        # {"type": "text", "text": "A chat between a curious human and an artificial intelligence assistant."},
-                        # {"type": "text", "text": "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human\'s questions. For visual tasks, the assistant explicitly analyzes image details and spatial relationships to provide answers grounded in strong logical reasoning and visual evidence."}, 
-                        {"type": "image", "image": image_path},
-                        {"type": "text", "text": question},
-                    ],
-                }
-            ]
-           
-            
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = process_vision_info(messages)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
-            inputs = inputs.to("cuda")
-            
-            # Find vision token range and update adapters
-            vis_start, vis_end = find_vision_token_range(inputs['input_ids'])
-            img_len = vis_end - vis_start
-            sys_len = vis_start
-            update_adapters_token_range(adapters, sys_len, img_len)
-            
-            # Generate
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
+        print(f"\n[Qwen2-VL Runner] Processing split: '{s}' ({len(samples)} samples) -> {raw_output_path}")
+        
+        with open(raw_output_path, "w", encoding="utf-8") as f_out:
+            for item in tqdm(samples, desc=f"Qwen2-VL POPE ({s})"):
+                question_id = item["question_id"]
+                image_name = item["image"]
+                question = item["text"]
+                label = item["label"]
+                
+                image_path = os.path.join(image_dir, image_name)
+                if not os.path.exists(image_path):
+                    continue
+                
+                # Include system preamble for sys_len and MANDATORY suffix for Qwen2-VL
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions."},
+                            {"type": "image", "image": image_path},
+                            {"type": "text", "text": f"{question} Please answer with yes or no."},
+                        ],
+                    }
+                ]
+                
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                image_inputs, video_inputs = process_vision_info(messages)
+                inputs = processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    padding=True,
+                    return_tensors="pt",
                 )
-            
-            generated_ids_trimmed = [
-                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )[0]
-            
-            # Write result to jsonl
-            result = {
-                "question_id": question_id,
-                "image": image_name,
-                "question": question,
-                "answer": output_text,
-                "label": label
-            }
-            f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
-            f_out.flush()
+                
+                # Move inputs to model device
+                inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+                
+                # Find vision token range and update adapters
+                vis_start, vis_end = find_vision_token_range(inputs["input_ids"])
+                img_len = vis_end - vis_start
+                sys_len = vis_start
+                update_adapters_token_range(adapters, sys_len, img_len)
+                
+                # Strict Greedy Generation (max_new_tokens=6)
+                with torch.inference_mode():
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        temperature=0.0,
+                    )
+                
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+                ]
+                output_text = processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )[0].strip()
+                
+                pred_decision = extract_prediction(output_text)
+                
+                result = {
+                    "question_id": question_id,
+                    "image": image_name,
+                    "question": question,
+                    "label": label,
+                    "pred": pred_decision,
+                    "answer": output_text,
+                    "text": output_text,
+                }
+                f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
+                f_out.flush()
+
+                # Clean cache periodically to avoid VRAM fragmentation across 3000 questions
+                if torch.cuda.is_available() and (question_id % 500 == 0):
+                    torch.cuda.empty_cache()
+                
+        # Evaluate split
+        metrics = evaluate_pope(pope_file, raw_output_path, metrics_output_path)
+        all_results[s] = {
+            "metrics": metrics,
+            "raw_output": raw_output_path,
+            "config": run_config,
+        }
+        print(f"[Qwen2-VL Runner] Split '{s}' Results:")
+        print(f"  Accuracy : {metrics['accuracy']*100:.2f}%")
+        print(f"  Precision: {metrics['precision']*100:.2f}%")
+        print(f"  Recall   : {metrics['recall']*100:.2f}%")
+        print(f"  F1-Score : {metrics['f1']*100:.2f}%")
+        print(f"  Yes-Ratio: {metrics['yes_ratio']*100:.2f}%")
+        
+    return all_results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Qwen2-VL Attention Adapter for POPE Evaluation")
+    parser.add_argument("--model_path", type=str, default="Qwen/Qwen2-VL-7B-Instruct")
+    parser.add_argument("--pope_dir", type=str, default="experiments/data/POPE/coco")
+    parser.add_argument("--image_dir", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default="results/qwen2vl_pope")
+    parser.add_argument("--split", type=str, default="all", choices=["random", "popular", "adversarial", "all"])
+    parser.add_argument("--lambda_causal", type=float, default=0.15)
+    parser.add_argument("--gamma_mix", type=float, default=0.15)
+    parser.add_argument("--layer_start", type=int, default=10)
+    parser.add_argument("--layer_end", type=int, default=20)
+    parser.add_argument("--max_new_tokens", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
     
-    print("\n" + "=" * 70)
-    print(f"Results saved to: {output_path}")
-    print("=" * 70)
-    
-    # Calculate accuracy
-    print("\nCalculating accuracy...")
-    correct = 0
-    total = 0
-    
-    with open(output_path, 'r') as f:
-        for line in f:
-            result = json.loads(line.strip())
-            answer = result['answer'].lower().strip()
-            label = result['label'].lower().strip()
-            
-            # Check if answer contains yes/no
-            if 'yes' in answer:
-                pred = 'yes'
-            elif 'no' in answer:
-                pred = 'no'
-            else:
-                pred = answer
-            
-            if pred == label:
-                correct += 1
-            total += 1
-    
-    accuracy = correct / total * 100 if total > 0 else 0
-    print(f"Accuracy: {correct}/{total} = {accuracy:.2f}%")
-    
-    print("\n" + "=" * 70)
-    print("Done!")
-    print("=" * 70)
+    run_qwen2vl_pope(
+        model_path=args.model_path,
+        pope_dir=args.pope_dir,
+        image_dir=args.image_dir,
+        output_dir=args.output_dir,
+        split=args.split,
+        lambda_causal=args.lambda_causal,
+        gamma_mix=args.gamma_mix,
+        layer_start=args.layer_start,
+        layer_end=args.layer_end,
+        max_new_tokens=args.max_new_tokens,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":

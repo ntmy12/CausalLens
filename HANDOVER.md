@@ -13,7 +13,13 @@ Evaluate hallucination mitigation methods (CausalLens, ONLY, OPERA) on VLMs (Qwe
 - Restricted `max_pixels: 313600` to speed up generation (down from 55 hours to ~10 hours).
 - Confirmed LLaVA natively runs Eager properly with `attn_impl="eager"`.
 
-## 4. Next Tasks for Agent
+## 4. POPE Evaluation Conditions & Configuration (BẮT BUỘC)
+- **Max New Tokens:** `max_new_tokens = 6`.
+- **Decoding Strategy:** **Greedy Decoding** (`do_sample=False`, `temperature=0.0`).
+- **Prompt Suffix for QwenVL:** Nếu chạy mô hình QwenVL (Qwen2-VL), bắt buộc thêm hậu tố (suffix) vào sau câu hỏi: `"Please answer with yes or no."`
+  - Ví dụ: `prompt = f"{question} Please answer with yes or no."`
+
+## 5. Next Tasks for Agent
 1. Clone OPERA repo: `git clone https://github.com/ntmy12/OPERA.git`
 2. Integrate OPERA decoding with Qwen2-VL in the existing framework.
-3. Run the OPERA evaluation on **POPE** (splits: `random`, `popular`, `adversarial`).
+3. Run the evaluation on **POPE** (splits: `random`, `popular`, `adversarial`) tuân thủ nghiêm ngặt các điều kiện: `max_new_tokens=6`, Greedy decoding, và prompt suffix `"Please answer with yes or no."` cho Qwen2-VL.
