@@ -71,10 +71,12 @@ class AttnAdapterHF(nn.Module):
         self.sys_len = int(sys_len)
         self.img_len = int(img_len)
 
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        # Support both old and new transformers configs
+        text_config = getattr(config, 'text_config', config)
+        self.hidden_size = text_config.hidden_size
+        self.num_heads = text_config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = getattr(config, "num_key_value_heads", self.num_heads)
+        self.num_key_value_heads = getattr(text_config, "num_key_value_heads", self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
         # Projections
