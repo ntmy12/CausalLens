@@ -8,7 +8,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, set_seed
-from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+try:
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+except ImportError:
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_rotary_pos_emb
+    apply_multimodal_rotary_pos_emb = None
 from transformers.cache_utils import Cache
 try:
     from qwen_vl_utils import process_vision_info
@@ -130,9 +134,14 @@ class Qwen2VLAttnAdapter(nn.Module):
         
         # ========== Step 2: Apply Rotary Position Embedding ==========
         cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
-        )
+        if apply_multimodal_rotary_pos_emb is not None:
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+            )
+        else:
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
         
         # ========== Step 3: Handle KV Cache ==========
         if past_key_values is not None:
