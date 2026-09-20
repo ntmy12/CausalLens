@@ -73,6 +73,12 @@ def main():
         help="Root directory for saving outputs and metrics.",
     )
     parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Explicit output directory (supports resuming an existing interrupted run).",
+    )
+    parser.add_argument(
         "--lambda_causal",
         type=float,
         default=0.15,
@@ -123,9 +129,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Create timestamped run folder
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_output_dir = os.path.join(args.output_dir, f"{args.model}_pope_{timestamp}")
+    # Create or use run folder (supports resuming)
+    if args.run_dir:
+        run_output_dir = os.path.abspath(args.run_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_output_dir = os.path.join(args.output_dir, f"{args.model}_pope_{timestamp}")
     os.makedirs(run_output_dir, exist_ok=True)
 
     print("\n" + "=" * 76)

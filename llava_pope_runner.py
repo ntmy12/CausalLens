@@ -167,11 +167,28 @@ def run_llava_pope(
         with open(pope_file, "r", encoding="utf-8") as f:
             samples = [json.loads(line) for line in f if line.strip()]
 
-        print(f"\n[LLaVA Runner] Processing split: '{s}' ({len(samples)} samples) -> {raw_output_path}")
+        # Check already finished questions for resumability
+        finished_qids = set()
+        if os.path.exists(raw_output_path):
+            with open(raw_output_path, "r", encoding="utf-8") as f_prev:
+                for line in f_prev:
+                    line = line.strip()
+                    if line:
+                        try:
+                            finished_qids.add(json.loads(line).get("question_id"))
+                        except Exception:
+                            pass
 
-        with open(raw_output_path, "w", encoding="utf-8") as f_out:
+        print(f"\n[LLaVA Runner] Processing split: '{s}' ({len(samples)} samples, {len(finished_qids)} already done) -> {raw_output_path}")
+
+        cached_image = None
+        cached_image_path = None
+
+        with open(raw_output_path, "a", encoding="utf-8") as f_out:
             for item in tqdm(samples, desc=f"LLaVA POPE ({s})"):
                 qid = item["question_id"]
+                if qid in finished_qids:
+                    continue
                 image_name = item["image"]
                 question = item["text"]
                 label = item["label"]
@@ -180,7 +197,16 @@ def run_llava_pope(
                 if not os.path.exists(image_path):
                     continue
 
-                image = Image.open(image_path).convert("RGB")
+                if image_path == cached_image_path and cached_image is not None:
+                    image = cached_image
+                else:
+                    try:
+                        image = Image.open(image_path).convert("RGB")
+                        cached_image = image
+                        cached_image_path = image_path
+                    except Exception as e:
+                        print(f"Error loading image {image_path}: {e}")
+                        continue
                 # Construct prompt with conversation format to maintain sys_len token prefix
                 prompt = (
                     "A chat between a curious human and an artificial intelligence assistant. "
