@@ -230,7 +230,7 @@ def run_llava_pope(
                 # Update token range for adapters
                 input_ids = inputs["input_ids"]
                 if (input_ids[0] == image_token_id).any():
-                    vis_start = (input_ids[0] == image_token_id).nonzero(as_tuple=True)[0].item()
+                    vis_start = (input_ids[0] == image_token_id).nonzero(as_tuple=True)[0][0].item()
                 else:
                     vis_start = sys_len
                 for adapter in adapters:
