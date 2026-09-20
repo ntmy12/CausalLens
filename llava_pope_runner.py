@@ -28,11 +28,15 @@ def inject_causallens_adapters(
     Inject AttnAdapterHF into language model decoder layers [layer_start, layer_end] (inclusive).
     """
     adapters = []
-    # In LlavaForConditionalGeneration, language model is at model.language_model.model.layers
+    # In LlavaForConditionalGeneration, language model is typically at model.language_model.model.layers or model.model.language_model.layers
     if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         layers = model.language_model.model.layers
+    elif hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+        layers = model.language_model.layers
     elif hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
+    elif hasattr(model, "model") and hasattr(model.model, "language_model") and hasattr(model.model.language_model, "layers"):
+        layers = model.model.language_model.layers
     else:
         raise AttributeError("Could not find transformer layers in Llava model.")
 
